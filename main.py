@@ -4,20 +4,17 @@ import json
 import os
 import re
 import shutil
+import socket
 import struct
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
-import winreg
-import winsound
+if os.name == "nt":
+    import winreg
+    import winsound
 from pathlib import Path
-
-try:
-    import tkinter  # noqa: F401  (para que PyInstaller lo empaquete)
-except ImportError:
-    pass
 
 from rich.console import Console
 from rich.live import Live
@@ -46,7 +43,7 @@ STEAM_DETECTION_TIMEOUT = 8 * 60
 STEAM_RETRY_WAIT = 20
 STEAM_RETRY_PAUSE = 30
 
-BASE_DIR = Path(os.environ.get("TEMP", ".")) / "DiscordQuests"
+BASE_DIR = Path(os.environ.get("TEMP", "/tmp")) / "DiscordQuests"
 MUTEX_NAME = r"Local\DiscordQuestCompleter"
 
 # Caché de la API (dura 1 hora)
@@ -129,6 +126,8 @@ class SingleInstance:
         self.handle = None
 
     def acquire(self) -> bool:
+        if os.name != "nt":
+            return True
         kernel32 = ctypes.windll.kernel32
         self.handle = kernel32.CreateMutexW(None, False, self.name)
         ERROR_ALREADY_EXISTS = 183
@@ -145,16 +144,6 @@ class SingleInstance:
 # ============================================================
 # Utilidades
 # ============================================================
-
-def is_frozen() -> bool:
-    return getattr(sys, "frozen", False)
-
-
-def get_current_executable() -> Path:
-    if is_frozen():
-        return Path(sys.executable).resolve()
-    return Path(__file__).resolve()
-
 
 def format_time(seconds: int) -> str:
     seconds = max(0, int(seconds))
@@ -242,7 +231,7 @@ def _reg_read(key: str, name: str):
         return None
 
 
-def _reg_write(key: str, name: str, value, kind=winreg.REG_DWORD):
+def _reg_write(key: str, name: str, value, kind=4):  # 4 = REG_DWORD
     with winreg.CreateKey(winreg.HKEY_CURRENT_USER, key) as k:
         winreg.SetValueEx(k, name, 0, kind, value)
 
@@ -317,12 +306,16 @@ class DiscordIPC:
         self.client_id = client_id
         self._pipe = None
         self.connected = False
-        self.user_info = None
 
     def connect(self) -> bool:
         for i in range(10):
             pipe_path = rf"\\.\pipe\discord-ipc-{i}"
             try:
+                if os.name != "nt":  # Linux: socket Unix en $XDG_RUNTIME_DIR
+                    s = socket.socket(socket.AF_UNIX)
+                    s.connect(f"{os.environ.get('XDG_RUNTIME_DIR', '/tmp')}/discord-ipc-{i}")
+                    self._pipe = s.makefile("rwb", buffering=0)
+                    break
                 self._pipe = open(pipe_path, "r+b", 0)
                 break
             except OSError:
@@ -336,7 +329,6 @@ class DiscordIPC:
             op, data = self._recv()
             if data and data.get("evt") == "READY":
                 self.connected = True
-                self.user_info = data.get("data", {}).get("user", {})
                 return True
             self._close_pipe()
             return False
@@ -658,6 +650,12 @@ def prepare_dummy_executable(game: dict, executable_name: str) -> tuple[Path, bo
     steamapps/common/<installdir>/, crea el appmanifest si no existe y
     simula en el registro que Steam lo lanzó. Devuelve (ruta_exe, usa_steam).
     """
+    if os.name != "nt":  # Linux: Discord solo mira juegos bajo .../steamapps/common/ (o Wine)
+        path = BASE_DIR / "steamapps" / "common" / safe_dir_name(game.get("name", "Game")) / executable_name.replace("\\", "/")
+        make_dirs(path.parent)
+        shutil.copy2(shutil.which("sleep"), path)  # binario real: nombre, ruta y /proc/<pid>/exe coinciden
+        CREATED_FILES.append(path)
+        return path, False
     steam_path = get_steam_install_path()
     steam_sku = get_steam_sku(game)
     game_name = game.get("name", "Game")
@@ -697,11 +695,7 @@ def prepare_dummy_executable(game: dict, executable_name: str) -> tuple[Path, bo
     make_dirs(full_exe_path.parent)
     kill_exe(full_exe_path)
 
-    if is_frozen():
-        full_exe_path.unlink(missing_ok=True)
-        shutil.copy2(get_current_executable(), full_exe_path)
-    else:
-        _compile_dummy_cs(game, full_exe_path)
+    _compile_dummy_cs(game, full_exe_path)
     CREATED_FILES.append(full_exe_path)
 
     if use_steam:
@@ -720,6 +714,8 @@ def prepare_dummy_executable(game: dict, executable_name: str) -> tuple[Path, bo
 
 def kill_exe(exe_path: Path):
     """Mata solo procesos que corren exactamente este .exe, no cualquiera con el mismo nombre."""
+    if os.name != "nt":  # en Linux el proceso lo para stop_process()
+        return
     subprocess.run(
         ["powershell", "-NoProfile", "-Command",
          "Get-CimInstance Win32_Process | Where-Object { $_.ExecutablePath -eq $env:DQC_EXE } "
@@ -739,8 +735,7 @@ def _compile_dummy_cs(game: dict, full_exe_path: Path):
         csc = windir / "Microsoft.NET" / "Framework" / "v4.0.30319" / "csc.exe"
     if not csc.exists():
         raise RuntimeError(
-            "Para correrlo desde el código fuente hace falta csc.exe (.NET Framework 4.0+).\n"
-            "O compílalo como .exe standalone."
+            "Hace falta csc.exe (.NET Framework 4.0+)."
         )
 
     safe_name = game.get("name", "Game").replace("\\", "\\\\").replace('"', "'")
@@ -786,50 +781,14 @@ class P {{
 
 
 # ============================================================
-# Modo dummy (ventana del "juego" en la versión .exe standalone)
-# ============================================================
-
-def dummy_mode(game_name: str):
-    try:
-        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
-        if hwnd:
-            ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
-    except Exception:
-        pass
-
-    try:
-        import tkinter as tk
-        root = tk.Tk()
-        root.title(game_name)
-        root.geometry("460x200")
-        root.resizable(False, False)
-        root.eval("tk::PlaceWindow . center")
-
-        tk.Label(root, text=game_name, font=("Segoe UI", 13, "bold")).pack(pady=(25, 5))
-        tk.Label(
-            root,
-            text="Ventana para la misión de Discord.\n¡No la cierres hasta que acabe el temporizador!",
-            font=("Segoe UI", 10),
-            fg="#333333"
-        ).pack(pady=5)
-
-        root.mainloop()
-    except Exception:
-        while True:
-            time.sleep(1)
-
-
-# ============================================================
 # Procesos
 # ============================================================
 
-def start_dummy(exe_path: Path, game_name: str):
-    """Lanza el juego falso con ventana visible (hace falta para transmitirlo)."""
-    cmd = [str(exe_path)]
-    if is_frozen():
-        cmd.extend(["--dummy", game_name])
+def start_dummy(exe_path: Path):
+    """Lanza el juego falso. Windows: ventana visible (hace falta para transmitirlo).
+    Linux: copia de `sleep`, sin ventana (no vale para misiones de Stream)."""
     return subprocess.Popen(
-        cmd,
+        [str(exe_path)] + (["infinity"] if os.name != "nt" else []),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL
@@ -839,6 +798,8 @@ def start_dummy(exe_path: Path, game_name: str):
 def stop_process(process):
     if process is None or process.poll() is not None:
         return
+    if os.name != "nt":
+        return process.kill()
     subprocess.run(
         ["taskkill", "/F", "/T", "/PID", str(process.pid)],
         stdout=subprocess.DEVNULL,
@@ -875,7 +836,7 @@ def cleanup():
 
 def discord_log_offsets() -> dict:
     """Tamaño actual de renderer_js.log de cada Discord instalado (stable/PTB/Canary)."""
-    appdata = Path(os.environ.get("APPDATA", ""))
+    appdata = Path(os.environ.get("APPDATA") or Path.home() / ".config")  # Linux: ~/.config/discord
     offsets = {}
     for name in ("discord", "discordptb", "discordcanary"):
         log = appdata / name / "logs" / "renderer_js.log"
@@ -907,7 +868,7 @@ def wait_for_detection(offsets: dict, exe_path: Path, process, timeout: int) -> 
     return False
 
 
-def launch_until_detected(exe_path: Path, game_name: str, retry: bool):
+def launch_until_detected(exe_path: Path, retry: bool):
     """
     Lanza el juego falso y espera a verlo en el log de Discord. Con el truco
     de Steam lo relanza hasta que Discord relea los manifiestos (~5 min),
@@ -919,7 +880,7 @@ def launch_until_detected(exe_path: Path, game_name: str, retry: bool):
     with console.status("Esperando a que Discord detecte el juego...") as status:
         while True:
             offsets = discord_log_offsets()
-            process = start_dummy(exe_path, game_name)
+            process = start_dummy(exe_path)
             time.sleep(0.5)
             if process.poll() is not None:
                 raise RuntimeError("El juego falso no arrancó.")
@@ -1108,7 +1069,8 @@ def main():
 
     process = None
     ipc = None
-    on_console_close(cleanup)
+    if os.name == "nt":
+        on_console_close(cleanup)
 
     try:
         console.print("[cyan]Cargando la base de juegos de Discord...[/cyan]")
@@ -1154,7 +1116,7 @@ def main():
                 "lo más probable es que Discord no lo detecte.[/yellow]"
             )
 
-        process, detected = launch_until_detected(full_exe_path, selected_name, retry=is_steam)
+        process, detected = launch_until_detected(full_exe_path, retry=is_steam)
         if detected:
             console.print("[green]✓ Discord detectó el juego. El tiempo empieza a contar ahora.[/green]\n")
         elif detected is False:
@@ -1209,9 +1171,4 @@ def main():
 
 
 if __name__ == "__main__":
-    if "--dummy" in sys.argv:
-        idx = sys.argv.index("--dummy")
-        dummy_mode(sys.argv[idx + 1] if len(sys.argv) > idx + 1 else "Discord Quest Game")
-        sys.exit(0)
-
     sys.exit(main())
